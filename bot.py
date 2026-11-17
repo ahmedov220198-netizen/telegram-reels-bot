@@ -26,11 +26,7 @@ bot_app = Application.builder().token(TOKEN).build()
 def valid_url(url):
     try:
         host = urlparse(url).hostname or ""
-        allowed = (
-            "instagram.com",
-            "youtube.com",
-            "youtu.be",
-        )
+        allowed = ("instagram.com", "youtube.com", "youtu.be")
         return any(
             host == domain or host.endswith("." + domain)
             for domain in allowed
@@ -49,7 +45,7 @@ async def run_command(*args):
 
     if process.returncode != 0:
         raise RuntimeError(
-            stderr.decode(errors="replace")[-1500:]
+            stderr.decode(errors="replace")[-2000:]
         )
 
     return stdout
@@ -57,46 +53,56 @@ async def run_command(*args):
 
 async def start(update, context):
     await update.message.reply_text(
-        "Salom! 👋\n\n"
-        "Menga Instagram Reels yoki YouTube Shorts "
-        "havolasini yubor.\n\n"
-        "Yoki video fayl yubor.\n"
-        "Men uni MP3 audio qilib beraman. 🎵"
+        "Привет! 👋\n\n"
+        "Отправь мне ссылку на Instagram Reels "
+        "или YouTube Shorts.\n\n"
+        "Я скачаю видео и отправлю тебе:\n"
+        "🎬 Видео MP4\n"
+        "🎵 Аудио MP3\n\n"
+        "Также я могу автоматически обрабатывать "
+        "ссылки в группе."
     )
 
 
-async def make_mp3(update, context, url=None):
-    message = update.message
+async def process_media(update, context, url=None):
+    message = update.effective_message
 
     status = await message.reply_text(
-        "⏳ Video qabul qilindi. MP3 tayyorlayapman..."
+        "⏳ Скачиваю видео и готовлю MP3..."
     )
 
     try:
-        with tempfile.TemporaryDirectory() as folder:
-            folder = Path(folder)
-            output = folder / "audio.mp3"
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "source.mp4"
+            video = folder / "video.mp4"
+            audio = folder / "audio.mp3"
 
             if url:
                 await run_command(
                     "yt-dlp",
                     "--no-playlist",
                     "--no-warnings",
-                    "--extract-audio",
-                    "--audio-format", "mp3",
-                    "--audio-quality", "4",
-                    "--max-filesize",
-                    f"{MAX_UPLOAD_MB}M",
-                    "-o", str(folder / "audio.%(ext)s"),
+                    "-f", "best[ext=mp4]/best",
+                    "--merge-output-format", "mp4",
+                    "--max-filesize", f"{MAX_UPLOAD_MB}M",
+                    "-o", str(folder / "download.%(ext)s"),
                     url,
                 )
+
+                downloaded = list(folder.glob("download.*"))
+
+                if not downloaded:
+                    raise RuntimeError("Видео не скачано")
+
+                source = downloaded[0]
 
             else:
                 media = message.video or message.document
 
                 if not media:
                     await status.edit_text(
-                        "Iltimos, video yubor."
+                        "❌ Отправь видеофайл."
                     )
                     return
 
@@ -104,50 +110,85 @@ async def make_mp3(update, context, url=None):
                     message.document.mime_type or ""
                 ).startswith("video/"):
                     await status.edit_text(
-                        "Iltimos, video fayl yubor."
+                        "❌ Это не видеофайл."
                     )
                     return
 
-                if media.file_size and media.file_size > 20 * 1024 * 1024:
+                if (
+                    media.file_size
+                    and media.file_size > MAX_UPLOAD_MB * 1024 * 1024
+                ):
                     await status.edit_text(
-                        "Video 20 MB dan kichik bo‘lishi kerak."
+                        "❌ Видео слишком большое. Максимум 49 МБ."
                     )
                     return
 
-                source = folder / "video.mp4"
                 telegram_file = await context.bot.get_file(
                     media.file_id
                 )
+
                 await telegram_file.download_to_drive(
                     custom_path=str(source)
                 )
 
-                await run_command(
-                    "ffmpeg",
-                    "-y",
-                    "-i", str(source),
-                    "-vn",
-                    "-codec:a", "libmp3lame",
-                    "-q:a", "4",
-                    str(output),
-                )
+            if source.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+                raise RuntimeError("Видео превышает лимит размера")
 
-            if not output.exists():
-                raise RuntimeError("MP3 fayl yaratilmadi.")
+            # Prepare MP4 video
+            await run_command(
+                "ffmpeg",
+                "-y",
+                "-i", str(source),
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(video),
+            )
 
-            size = output.stat().st_size
+            # Extract MP3 audio
+            await run_command(
+                "ffmpeg",
+                "-y",
+                "-i", str(video),
+                "-vn",
+                "-codec:a", "libmp3lame",
+                "-q:a", "4",
+                str(audio),
+            )
 
-            if size > MAX_UPLOAD_MB * 1024 * 1024:
+            limit = MAX_UPLOAD_MB * 1024 * 1024
+
+            if video.stat().st_size > limit:
                 await status.edit_text(
-                    "MP3 fayl juda katta. Kichikroq video yubor."
+                    "❌ Видео слишком большое для отправки в Telegram."
                 )
                 return
 
-            with open(output, "rb") as audio:
+            if audio.stat().st_size > limit:
+                await status.edit_text(
+                    "❌ MP3 слишком большой для отправки."
+                )
+                return
+
+            # Send video
+            with open(video, "rb") as video_file:
+                await message.reply_video(
+                    video=video_file,
+                    supports_streaming=True,
+                    caption="🎬 Готово! Видео MP4"
+                )
+
+            # Send audio
+            with open(audio, "rb") as audio_file:
                 await message.reply_audio(
-                    audio=audio,
+                    audio=audio_file,
                     filename="audio.mp3",
-                    title="MP3 Audio",
+                    title="MP3 Audio"
                 )
 
             await status.delete()
@@ -155,25 +196,27 @@ async def make_mp3(update, context, url=None):
     except Exception as error:
         print("PROCESSING ERROR:", str(error))
         await status.edit_text(
-            "❌ Videoni qayta ishlashda xatolik yuz berdi.\n"
-            "Boshqa video yoki havola yuborib ko‘r."
+            "❌ Не удалось обработать видео.\n"
+            "Попробуй другую ссылку или видеофайл."
         )
 
 
 async def handle_video(update, context):
-    await make_mp3(update, context)
+    await process_media(update, context)
 
 
 async def handle_link(update, context):
-    url = update.message.text.strip()
+    message = update.effective_message
+    text = message.text or message.caption or ""
 
-    if not valid_url(url):
-        await update.message.reply_text(
-            "Instagram yoki YouTube havolasini yubor."
-        )
-        return
+    urls = re.findall(r'https?://[^\s<>]+', text)
 
-    await make_mp3(update, context, url=url)
+    for url in urls:
+        url = url.rstrip(".,!?;:)]}")
+
+        if valid_url(url):
+            await process_media(update, context, url=url)
+            return
 
 
 bot_app.add_handler(CommandHandler("start", start))
@@ -187,7 +230,7 @@ bot_app.add_handler(
 
 bot_app.add_handler(
     MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
+        (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
         handle_link,
     )
 )
@@ -206,6 +249,7 @@ async def lifespan(app):
 
     yield
 
+    await bot_app.bot.delete_webhook()
     await bot_app.stop()
     await bot_app.shutdown()
 
@@ -222,7 +266,6 @@ async def home():
 async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, bot_app.bot)
-
     await bot_app.process_update(update)
 
     return {"ok": True}
