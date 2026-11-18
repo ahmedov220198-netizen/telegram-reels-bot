@@ -1,216 +1,186 @@
 import os
 import re
 import asyncio
+import logging
 import tempfile
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+import yt_dlp
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger(__name__)
 
 TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 WEBHOOK_PATH = "/telegram"
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-bot_app = Application.builder().token(TOKEN).build()
+MAX_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
+MAX_BYTES = MAX_MB * 1024 * 1024
 
-
-def valid_url(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-        allowed = ("instagram.com", "youtube.com", "youtu.be")
-        return any(host == domain or host.endswith("." + domain) for domain in allowed)
-    except Exception:
-        return False
+bot = Application.builder().token(TOKEN).build()
 
 
-async def run_command(*args):
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Salom! 👋\n\n"
+        "Menga YouTube Shorts yoki Instagram Reels havolasini yubor.\n"
+        "Men videoni MP4 va audiosini MP3 qilib yuboraman."
     )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(stderr.decode(errors="replace")[-2500:])
-    return stdout
 
 
-async def start(update, context):
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Привет! 👋\n\n"
-            "Отправь ссылку на Instagram Reels или YouTube Shorts.\n"
-            "Я постараюсь скачать видео и отправить:\n"
-            "🎬 MP4 — видео\n"
-            "🎵 MP3 — аудио\n\n"
-            "В группе просто отправь ссылку в сообщении."
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+def download_video(url, folder):
+    options = {
+        "outtmpl": str(Path(folder) / "video.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "socket_timeout": 30,
+        "max_filesize": MAX_BYTES,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = Path(ydl.prepare_filename(info))
+
+    if not path.exists():
+        files = list(Path(folder).glob("video.*"))
+        if not files:
+            raise RuntimeError("Video file not found")
+        path = files[0]
+
+    if path.stat().st_size > MAX_BYTES:
+        raise RuntimeError("Video exceeds Telegram upload limit")
+
+    audio = Path(folder) / "audio.mp3"
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(path),
+            "-vn",
+            "-codec:a", "libmp3lame",
+            "-q:a", "4",
+            str(audio)
+        ],
+        check=True,
+        capture_output=True,
+        timeout=180
+    )
+
+    return path, audio
+
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+
+    if not message or not message.text:
+        return
+
+    match = re.search(r"https?://\S+", message.text)
+
+    if not match:
+        await message.reply_text(
+            "Menga YouTube yoki Instagram havolasini yubor."
+        )
+        return
+
+    url = match.group(0).rstrip(".,!?)]}")
+    host = (urlparse(url).hostname or "").lower()
+
+    if not (
+        host == "youtu.be"
+        or host.endswith("youtube.com")
+        or host.endswith("instagram.com")
+    ):
+        await message.reply_text("Faqat YouTube va Instagram havolalari.")
+        return
+
+    status = await message.reply_text("⏳ Yuklanmoqda...")
+
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            video, audio = await asyncio.to_thread(
+                download_video, url, folder
+            )
+
+            with open(video, "rb") as file:
+                await message.reply_video(
+                    video=file,
+                    caption="🎬 Video",
+                    read_timeout=180,
+                    write_timeout=180
+                )
+
+            if audio.exists() and audio.stat().st_size <= MAX_BYTES:
+                with open(audio, "rb") as file:
+                    await message.reply_audio(
+                        audio=file,
+                        filename="audio.mp3",
+                        title="MP3",
+                        read_timeout=180,
+                        write_timeout=180
+                    )
+
+        await status.delete()
+
+    except Exception as error:
+        log.exception("Download error")
+        await status.edit_text(
+            "❌ Yuklab olishda xatolik.\n\n"
+            + str(error)[:800]
         )
 
 
-async def process_media(update, context, url=None):
-    message = update.effective_message
-    if not message:
-        return
-
-    status = await message.reply_text("⏳ Загружаю видео и готовлю MP3...")
-
-    try:
-        with tempfile.TemporaryDirectory() as temp:
-            folder = Path(temp)
-            source = folder / "source.mp4"
-            video = folder / "video.mp4"
-            audio = folder / "audio.mp3"
-
-            if url:
-                # yt-dlp downloads the best available source; ffmpeg below
-                # converts it to a Telegram-friendly MP4.
-                await run_command(
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--format", "bv*+ba/b",
-                    "--merge-output-format", "mp4",
-                    "--max-filesize", f"{MAX_UPLOAD_MB}M",
-                    "--output", str(folder / "raw.%(ext)s"),
-                    url,
-                )
-
-                candidates = [
-                    p for p in folder.glob("raw.*")
-                    if p.is_file() and not p.name.endswith((".part", ".ytdl"))
-                ]
-                if not candidates:
-                    raise RuntimeError("Не удалось скачать исходное видео.")
-                source = candidates[0]
-
-            else:
-                media = message.video or message.document
-                if not media or (
-                    message.document
-                    and not (message.document.mime_type or "").startswith("video/")
-                ):
-                    await status.edit_text("❌ Отправь видеофайл или ссылку.")
-                    return
-
-                if media.file_size and media.file_size > MAX_UPLOAD_BYTES:
-                    await status.edit_text(
-                        f"❌ Видео больше {MAX_UPLOAD_MB} МБ. Отправь файл поменьше."
-                    )
-                    return
-
-                telegram_file = await context.bot.get_file(media.file_id)
-                await telegram_file.download_to_drive(custom_path=str(source))
-
-            if source.stat().st_size > MAX_UPLOAD_BYTES:
-                raise RuntimeError(f"Исходное видео больше {MAX_UPLOAD_MB} МБ.")
-
-            # Re-encode to MP4 for compatibility.
-            await run_command(
-                "ffmpeg", "-y",
-                "-i", str(source),
-                "-map", "0:v:0",
-                "-map", "0:a?",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "25",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                str(video),
-            )
-
-            await run_command(
-                "ffmpeg", "-y",
-                "-i", str(video),
-                "-vn",
-                "-codec:a", "libmp3lame",
-                "-q:a", "4",
-                str(audio),
-            )
-
-            for path, label in ((video, "Видео"), (audio, "MP3")):
-                if not path.exists():
-                    raise RuntimeError(f"{label}: файл не создан.")
-                if path.stat().st_size > MAX_UPLOAD_BYTES:
-                    raise RuntimeError(f"{label}: файл превышает лимит {MAX_UPLOAD_MB} МБ.")
-
-            with open(video, "rb") as video_file:
-                await message.reply_video(
-                    video=video_file,
-                    supports_streaming=True,
-                    caption="🎬 Готово! Видео MP4"
-                )
-
-            with open(audio, "rb") as audio_file:
-                await message.reply_audio(
-                    audio=audio_file,
-                    filename="audio.mp3",
-                    title="MP3 Audio"
-                )
-
-            await status.delete()
-
-    except Exception as error:
-        error_text = str(error)
-        print("PROCESSING ERROR:", error_text)
-        if "Sign in to confirm" in error_text or "not a bot" in error_text.lower():
-            reply = (
-                "❌ YouTube временно блокирует загрузку с сервера Render.\n"
-                "Для этого ролика требуется подтверждение YouTube. "
-                "Без cookies или другого разрешённого источника бот не сможет "
-                "гарантированно скачать его."
-            )
-        else:
-            reply = (
-                "❌ Не удалось обработать видео.\n"
-                "Попробуй другую ссылку или видеофайл."
-            )
-        await status.edit_text(reply)
-
-
-async def handle_video(update, context):
-    await process_media(update, context)
-
-
-async def handle_link(update, context):
-    message = update.effective_message
-    if not message:
-        return
-
-    text = message.text or message.caption or ""
-    urls = re.findall(r"https?://[^\s<>]+", text)
-
-    for url in urls:
-        url = url.rstrip(".,!?;:)]}")
-        if valid_url(url):
-            await process_media(update, context, url=url)
-            return
-
-
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(
-    MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video)
-)
-bot_app.add_handler(
-    MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_link)
+bot.add_handler(CommandHandler("start", start))
+bot.add_handler(CommandHandler("help", help_command))
+bot.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.bot.set_webhook(BASE_URL + WEBHOOK_PATH)
-    print("Telegram bot started successfully!")
+    await bot.initialize()
+    await bot.start()
+
+    await bot.bot.set_webhook(
+        url=BASE_URL + WEBHOOK_PATH,
+        secret_token=WEBHOOK_SECRET or None,
+        drop_pending_updates=True
+    )
+
+    log.info("Telegram webhook is active")
+
     yield
-    await bot_app.bot.delete_webhook()
-    await bot_app.stop()
-    await bot_app.shutdown()
+
+    await bot.bot.delete_webhook()
+    await bot.stop()
+    await bot.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -218,12 +188,25 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def home():
-    return {"status": "Bot is running"}
+    return {"status": "live", "bot": "running"}
 
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, bot_app.bot)
-    await bot_app.process_update(update)
-    return {"ok": True}
+async def webhook(request: Request):
+
+    if WEBHOOK_SECRET:
+        secret = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token", ""
+        )
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403)
+
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot.bot)
+        await bot.process_update(update)
+        return {"ok": True}
+
+    except Exception:
+        log.exception("Webhook error")
+        raise HTTPException(status_code=500)
