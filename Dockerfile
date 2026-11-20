@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Deno JavaScript runtime
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,7 +11,10 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --pre --upgrade "yt-dlp[default]" \
+    && python -m yt_dlp --version \
+    && deno --version
 
 COPY bot.py .
 
