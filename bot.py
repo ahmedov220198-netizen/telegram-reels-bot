@@ -62,7 +62,7 @@ WELCOME = (
     "🇷🇺 Привет! Добро пожаловать в бот Reels & Shorts.\n\n"
     "Сначала вступи в нашу группу.\n"
     "После вступления нажми кнопку проверки.\n\n"
-    "Чтобы скачать видео, отправь ссылку прямо в группу."
+    "Чтобы скачать видео, отправь ссылку прямо в нашу группу."
 )
 
 JOIN_TEXT = (
@@ -160,36 +160,30 @@ def download_video(url: str, folder: str):
     options = {
         "outtmpl": os.path.join(folder, "video.%(ext)s"),
 
-        "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "best[ext=mp4]/best"
-        ),
+        # Basit MP4 format seçimi
+        "format": "best[ext=mp4]/best",
 
-        "merge_output_format": "mp4",
         "noplaylist": True,
-
         "quiet": True,
         "no_warnings": True,
 
         "max_filesize": MAX_UPLOAD_MB * 1024 * 1024,
 
-        # Bağlantı ayarları
         "socket_timeout": 45,
 
         # Yeniden deneme
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
 
-        # İstekleri yavaşlat
+        # İstek aralıkları
         "sleep_interval": 2,
         "max_sleep_interval": 5,
         "sleep_interval_requests": 2,
 
-        # Paralel indirmeyi sınırlandır
         "concurrent_fragment_downloads": 1,
 
-        # Tarayıcı User-Agent
+        # User-Agent
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -251,10 +245,8 @@ async def handle_group_message(
     )
 
     try:
-        # Aynı anda yalnızca bir indirme
         async with DOWNLOAD_LOCK:
 
-            # İstekler arasında bekleme
             await asyncio.sleep(3)
 
             with tempfile.TemporaryDirectory() as folder:
